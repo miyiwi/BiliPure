@@ -1,0 +1,28 @@
+name: bilipure
+description: "BiliPure - 一个轻量的第三方哔哩哔哩客户端"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  dio: ^5.11.1
+  crypto: ^3.0.6
+  provider: ^6.1.5
+  cached_network_image: ^4.0.6
+  video_player: ^2.14.1
+  shared_preferences: ^2.5.6
+  qr_flutter: ^4.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

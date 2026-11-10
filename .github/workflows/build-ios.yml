@@ -1,0 +1,105 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios:
+    name: Build unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain info
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun simctl list runtimes | head -5 || true
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter --version && flutter doctor -v
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos
+
+      - name: Run tests
+        run: flutter test
+
+      # 注意：Flutter 项目的 ios/Podfile 由 flutter build 首次运行时生成。
+      # 因此这里不单独执行 pod install，交给 flutter build 处理。
+      - name: Build iOS (no codesign)
+        run: |
+          set -euo pipefail
+          ARGS=(--release --no-codesign --dart-define=BUILD_SHA="${GITHUB_SHA}")
+          # 只有打 tag（v1.2.3）时才覆盖版本号，分支构建沿用 pubspec.yaml
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            ARGS+=(--build-name "${GITHUB_REF_NAME#v}")
+          fi
+          echo "flutter build ios ${ARGS[*]}"
+          flutter build ios "${ARGS[@]}"
+
+      - name: Verify build output
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          ls -la build/ios/iphoneos/ || true
+          if [ ! -d "$APP" ]; then
+            echo "::error::Runner.app not found"
+            exit 1
+          fi
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" || true
+          du -sh "$APP"
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          rm -rf build/ipa
+          mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          # 清掉可能残留的代码签名 / 扩展属性
+          xattr -cr build/ipa/Payload/Runner.app || true
+          cd build/ipa
+          zip -qry "../BiliPure-unsigned.ipa" Payload
+          cd - >/dev/null
+          ls -lh build/BiliPure-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: BiliPure-unsigned-ipa
+          path: build/BiliPure-unsigned.ipa
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload dSYMs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: dSYMs
+          path: build/ios/iphoneos/Runner.app.dSYM
+          if-no-files-found: ignore
+          retention-days: 7
