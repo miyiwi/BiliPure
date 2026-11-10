@@ -217,10 +217,14 @@ class BiliApi {
   }
 
   /// 当前登录用户信息（未登录时 isLogin=false）
+  ///
+  /// 未登录时该接口返回 code=-101（账号未登录），这里放行，
+  /// 让「我的」页面正常显示未登录状态和扫码登录入口。
   Future<Map<String, dynamic>> navInfo() async {
     final json = await _client.getJson(
       'https://api.bilibili.com/x/web-interface/nav',
       withWbi: false,
+      acceptCodes: const {-101},
     );
     final data = json['data'];
     return data is Map<String, dynamic> ? data : <String, dynamic>{};

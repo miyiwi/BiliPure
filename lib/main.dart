@@ -69,33 +69,44 @@ class _RootShellState extends State<RootShell> {
 
   @override
   Widget build(BuildContext context) {
+    // 底部 home indicator 的安全间距。Material 3 的 NavigationBar 不会
+    // 自动避开它，必须手动补 padding，否则标签会被刘海遮住一半。
+    final bottomInset = MediaQuery.viewPaddingOf(context).bottom;
     return Scaffold(
-      body: IndexedStack(
-        index: _index,
-        children: const [HomePage(), PopularPage(), MinePage()],
+      // 顶部安全区：避免内容被刘海 / 状态栏遮挡
+      body: SafeArea(
+        top: true,
+        bottom: false,
+        child: IndexedStack(
+          index: _index,
+          children: const [HomePage(), PopularPage(), MinePage()],
+        ),
       ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _index,
-        onDestinationSelected: (i) => setState(() => _index = i),
-        height: 58,
-        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.home_outlined),
-            selectedIcon: Icon(Icons.home_rounded),
-            label: '推荐',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.local_fire_department_outlined),
-            selectedIcon: Icon(Icons.local_fire_department_rounded),
-            label: '热门',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.person_outline_rounded),
-            selectedIcon: Icon(Icons.person_rounded),
-            label: '我的',
-          ),
-        ],
+      bottomNavigationBar: Padding(
+        padding: EdgeInsets.only(bottom: bottomInset),
+        child: NavigationBar(
+          selectedIndex: _index,
+          onDestinationSelected: (i) => setState(() => _index = i),
+          height: 58,
+          labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+          destinations: const [
+            NavigationDestination(
+              icon: Icon(Icons.home_outlined),
+              selectedIcon: Icon(Icons.home_rounded),
+              label: '推荐',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.local_fire_department_outlined),
+              selectedIcon: Icon(Icons.local_fire_department_rounded),
+              label: '热门',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.person_outline_rounded),
+              selectedIcon: Icon(Icons.person_rounded),
+              label: '我的',
+            ),
+          ],
+        ),
       ),
     );
   }

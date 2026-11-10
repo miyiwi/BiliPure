@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:bilipure/core/bili_envelope.dart';
 import 'package:bilipure/core/format.dart';
 import 'package:bilipure/core/wbi.dart';
 import 'package:bilipure/models/danmaku.dart';
@@ -8,6 +9,31 @@ import 'package:bilipure/models/play_info.dart';
 import 'package:bilipure/services/danmaku_service.dart';
 
 void main() {
+  group('响应信封判定', () {
+    test('code=0 视为成功', () {
+      expect(isEnvelopeOk(0, const {}), isTrue);
+    });
+
+    test('未登录 nav 的 -101 默认应算失败', () {
+      // 不传 acceptCodes 时 -101 就是错误，这是原始 bug 的来源
+      expect(isEnvelopeOk(-101, const {}), isFalse);
+    });
+
+    test('acceptCodes 放行 -101 后视为成功', () {
+      // nav 接口需要放行 -101，否则拿不到 WBI 密钥、我的页会报错
+      expect(isEnvelopeOk(-101, const {-101}), isTrue);
+    });
+
+    test('-412 风控不会被 acceptCodes 意外放行', () {
+      expect(isEnvelopeOk(-412, const {-101}), isFalse);
+    });
+
+    test('其它业务错误码仍然失败', () {
+      expect(isEnvelopeOk(-400, const {-101}), isFalse);
+      expect(isEnvelopeOk(62002, const {-101}), isFalse);
+    });
+  });
+
   group('格式化', () {
     test('播放量', () {
       expect(formatCount(999), '999');

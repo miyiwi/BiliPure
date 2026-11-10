@@ -6,6 +6,7 @@ import 'package:dio/dio.dart';
 import 'package:dio/io.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'bili_envelope.dart';
 import 'wbi.dart';
 
 /// 全局 Cookie 罐：持久化到 SharedPreferences，模拟浏览器的登录态。
@@ -187,7 +188,13 @@ class BiliClient {
     if (cached != null && fetched != null && DateTime.now().difference(fetched).inHours < 6) {
       return cached;
     }
-    final json = await getJson('https://api.bilibili.com/x/web-interface/nav', withWbi: false);
+    // nav 在未登录时返回 code=-101（账号未登录），但 wbi_img 仍然可用，
+    // 所以必须把 -101 视为正常响应，否则拿不到签名密钥。
+    final json = await getJson(
+      'https://api.bilibili.com/x/web-interface/nav',
+      withWbi: false,
+      acceptCodes: const {-101},
+    );
     final data = json['data'];
     String imgUrl = '';
     String subUrl = '';
@@ -215,12 +222,15 @@ class BiliClient {
   /// 发请求并拆信封
   ///
   /// [withWbi] 为 true 时自动追加 WBI 签名参数。
+  /// [acceptCodes] 里列出的业务 code 会当作成功返回，而不是抛异常。
+  /// 例如 nav 接口在未登录时返回 -101（账号未登录），但数据仍然有用。
   Future<Map<String, dynamic>> getJson(
     String url, {
     Map<String, dynamic>? query,
     bool withWbi = true,
     bool retryOnBuvid = true,
     int retries = 2,
+    Set<int> acceptCodes = const {},
   }) async {
     final params = <String, dynamic>{...?query};
 
@@ -230,6 +240,7 @@ class BiliClient {
       withWbi: withWbi,
       retryOnBuvid: retryOnBuvid,
       retries: retries,
+      acceptCodes: acceptCodes,
     );
   }
 
@@ -239,6 +250,7 @@ class BiliClient {
     bool withWbi = false,
     bool retryOnBuvid = true,
     int retries = 2,
+    Set<int> acceptCodes = const {},
   }) async {
     Object? lastError;
     for (var attempt = 0; attempt <= retries; attempt++) {
@@ -271,17 +283,20 @@ class BiliClient {
           throw BiliException('响应格式异常');
         }
         final code = decoded['code'];
-        if (code is int && code != 0) {
+        final codeValue = code is int ? code : null;
+        if (!isEnvelopeOk(codeValue, acceptCodes)) {
           final msg = decoded['message']?.toString() ?? '未知错误';
           // -412 被风控 / -352 校验失败：刷新 buvid 后重试一次
-          if (retryOnBuvid && (code == -412 || code == -352) && attempt < 1) {
+          if (retryOnBuvid &&
+              (codeValue == -412 || codeValue == -352) &&
+              attempt < 1) {
             await jar.setAll({'buvid3': WbiSigner.randomBuvid3()});
             _wbi = null;
             _wbiFetchedAt = null;
             await _refreshWbi();
             continue;
           }
-          throw BiliException(msg, code: code);
+          throw BiliException(msg, code: codeValue);
         }
         return decoded;
       } on DioException catch (e) {

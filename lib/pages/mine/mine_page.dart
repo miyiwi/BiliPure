@@ -92,9 +92,6 @@ class _MinePageState extends State<MinePage>
     if (_loading) {
       return const Center(child: CircularProgressIndicator());
     }
-    if (_error != null) {
-      return ErrorView(message: _error!, onRetry: _loadNav);
-    }
 
     final uname = _nav?['uname']?.toString() ?? '';
     final face = _nav?['face']?.toString() ?? '';
@@ -108,6 +105,41 @@ class _MinePageState extends State<MinePage>
         physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 20),
         children: [
+          Padding(
+            padding: const EdgeInsets.only(bottom: 18),
+            child: Text(
+              '我的',
+              style: theme.textTheme.headlineSmall?.copyWith(
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          // 拉取账号信息失败时只提示，不影响登录入口——
+          // 否则网络一抖动，用户就找不到登录按钮了。
+          if (_error != null) ...[
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.errorContainer.withValues(alpha: 0.5),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.wifi_off_rounded, size: 16, color: theme.colorScheme.error),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '账号信息获取失败，可下拉重试',
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: theme.colorScheme.error,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+          ],
           if (_isLogin) ...[
             Center(
               child: CircleAvatar(

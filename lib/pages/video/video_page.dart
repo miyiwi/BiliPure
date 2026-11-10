@@ -257,6 +257,8 @@ class _VideoPageState extends State<VideoPage> {
     return Scaffold(
       backgroundColor: Colors.black,
       body: SafeArea(
+        // 顶部留出刘海，底部不留白，让视频区域尽可能大；
+        // 底部列表内容用 MediaQuery 的 viewPadding 单独补足。
         bottom: false,
         child: Column(
           children: [
@@ -521,7 +523,10 @@ class _VideoPageState extends State<VideoPage> {
               ),
             ),
           ],
-          const SizedBox(height: 30),
+          // 底部安全区：给 home indicator 留出空间
+          SizedBox(
+            height: 30 + MediaQuery.viewPaddingOf(context).bottom,
+          ),
         ],
       ),
     );
