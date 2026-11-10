@@ -222,30 +222,43 @@ class BiliClient {
     bool retryOnBuvid = true,
     int retries = 2,
   }) async {
-    Map<String, dynamic> params = {...?query};
+    final params = <String, dynamic>{...?query};
 
-    if (withWbi) {
-      final signer = await _refreshWbi();
-      final signed = signer.signQuery(params);
-      // 把签名后的 query 直接拼到 URL 上，避免二次编码
-      final sep = url.contains('?') ? '&' : '?';
-      final fullUrl = '$url$sep$signed';
-      return _execute(fullUrl, {}, retryOnBuvid: retryOnBuvid, retries: retries);
-    }
-
-    return _execute(url, params, retryOnBuvid: retryOnBuvid, retries: retries);
+    return _execute(
+      url,
+      params,
+      withWbi: withWbi,
+      retryOnBuvid: retryOnBuvid,
+      retries: retries,
+    );
   }
 
   Future<Map<String, dynamic>> _execute(
     String url,
     Map<String, dynamic> query, {
+    bool withWbi = false,
     bool retryOnBuvid = true,
     int retries = 2,
   }) async {
     Object? lastError;
     for (var attempt = 0; attempt <= retries; attempt++) {
       try {
-        final resp = await _dio.get<String>(url, queryParameters: query.isEmpty ? null : query);
+        // 注意：WBI 签名必须在循环内生成。
+        // 否则刷新 buvid 后重试的仍是那个失效的 w_rid，重试永远不会成功。
+        var requestUrl = url;
+        var requestQuery = query;
+        if (withWbi) {
+          final signer = await _refreshWbi();
+          final signed = signer.signQuery(query);
+          final sep = url.contains('?') ? '&' : '?';
+          requestUrl = '$url$sep$signed';
+          requestQuery = const {};
+        }
+
+        final resp = await _dio.get<String>(
+          requestUrl,
+          queryParameters: requestQuery.isEmpty ? null : requestQuery,
+        );
         final status = resp.statusCode ?? 0;
         if (status < 200 || status >= 300) {
           throw BiliException('HTTP $status', code: -status);

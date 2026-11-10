@@ -74,29 +74,41 @@ bilibili 的 web 接口会对参数签名，否则返回 `-352`。实现见 `lib
 
 推送到 `main` 分支或手动触发 `workflow_dispatch`，工作流会自动：
 
-1. 在 `macos-latest` 上安装 Flutter
-2. `flutter analyze` + `flutter test`
+1. 在 `macos-15` 上安装 Flutter 3.47.9
+2. `flutter analyze` + `flutter test`（22 个用例）
 3. `flutter build ios --release --no-codesign`
 4. 打包成 **未签名 ipa**，作为 artifact 上传
 
 产物在 Actions 运行页面的 **Artifacts → BiliPure-unsigned-ipa** 下载。
 
+> **依赖版本已锁定**：`video_player_avfoundation` 固定在 `2.12.1`。
+> 2.12.2+ 的 Swift 源码使用了 `isolation:` 参数（Swift 6.2 API），在 runner 自带的 Xcode 上会报
+> `Extra argument 'isolation' in call` 而编译失败。
+
 ### 安装到 iPhone
 
-未签名 ipa 需要自行签名后安装，常见方式：
+Actions 产出的是**未签名** ipa，Apple 设备不会直接安装，需要用自己的证书重签：
 
-- **AltStore / SideStore**：导入 ipa，用你的 Apple ID 重签
-- **TrollStore**：支持的设备可直接安装
-- **Xcode**：`flutter build ios` 后连接真机运行
+| 方式 | 说明 |
+| --- | --- |
+| **AltStore / SideStore** | 导入 ipa，用免费 Apple ID 重签，有效期 7 天 |
+| **TrollStore** | 仅支持特定系统版本的设备，可永久安装 |
+| **Sideloadly** | Windows / macOS 图形化重签工具，需要 Apple ID |
+| **Xcode** | 有 Mac 时 `flutter run --release` 直接装到真机 |
 
-> 免费 Apple ID 签名的应用有效期为 7 天，过期需重签。
+免费 Apple ID 签名的应用 **7 天后会失效**，需要重新签名。这是 iOS 的限制，与本项目无关。
 
 ### 本地构建（需要 Mac）
 
 ```bash
 flutter pub get
-cd ios && pod install && cd ..
 flutter build ios --release --no-codesign
+```
+
+如果要用自己的开发者证书出可安装的 ipa：
+
+```bash
+flutter build ipa --export-method development
 ```
 
 ## 免责声明
