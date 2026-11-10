@@ -1,6 +1,8 @@
 import '../core/http.dart';
+import '../models/comment.dart';
 import '../models/feed_item.dart';
 import '../models/play_info.dart';
+import '../models/space.dart';
 import '../models/video_detail.dart';
 
 /// bilibili 业务接口封装。所有方法都返回已解析好的模型。
@@ -232,11 +234,17 @@ class BiliApi {
 
   Future<void> logout() => _client.jar.clear();
 
-  /// 评论（第一版仅只读展示）
-  Future<List<CommentItem>> comments({
+  /// 是否具备写操作能力（已登录 + 有 csrf）
+  Future<bool> canWrite() async => _client.jar.canWrite;
+
+  // ---------------------------------------------------------------- 评论
+
+  /// 拉取评论（sort: 2=按热度，0=按时间）
+  Future<CommentPage> comments({
     required int aid,
     int page = 1,
     int ps = 20,
+    int sort = 2,
   }) async {
     final json = await _client.getJson(
       'https://api.bilibili.com/x/v2/reply',
@@ -245,21 +253,229 @@ class BiliApi {
         'oid': aid,
         'pn': page,
         'ps': ps,
-        'sort': 2, // 2=按热度
+        'sort': sort,
       },
       withWbi: false,
     );
     final data = json['data'];
-    if (data is! Map) return const [];
+    if (data is! Map) {
+      return const CommentPage(comments: [], total: 0, hasMore: false);
+    }
+    final pageInfo = data['page'];
+    final total = pageInfo is Map ? _asInt(pageInfo['count']) : 0;
     final replies = data['replies'];
-    if (replies is! List) return const [];
-    final out = <CommentItem>[];
-    for (final raw in replies) {
-      if (raw is! Map<String, dynamic>) continue;
-      out.add(CommentItem.fromJson(raw));
+    final out = <Comment>[];
+    if (replies is List) {
+      for (final raw in replies) {
+        if (raw is Map<String, dynamic>) out.add(Comment.fromJson(raw));
+      }
+    }
+    return CommentPage(
+      comments: out,
+      total: total,
+      hasMore: out.isNotEmpty && (page * ps) < total,
+    );
+  }
+
+  // ------------------------------------------------------------ 三连相关
+
+  /// 是否已点赞
+  Future<bool> hasLike(String bvid) async {
+    if (!_client.jar.isLoggedIn) return false;
+    try {
+      final json = await _client.getJson(
+        'https://api.bilibili.com/x/web-interface/archive/has/like',
+        query: {'bvid': bvid},
+        withWbi: false,
+      );
+      return _asInt(json['data']) == 1;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 已投币数（0/1/2）
+  Future<int> coinCount(String bvid) async {
+    if (!_client.jar.isLoggedIn) return 0;
+    try {
+      final json = await _client.getJson(
+        'https://api.bilibili.com/x/web-interface/archive/coins',
+        query: {'bvid': bvid},
+        withWbi: false,
+      );
+      final data = json['data'];
+      if (data is Map) return _asInt(data['multiply']);
+      return 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /// 是否已收藏
+  Future<bool> hasFav(int aid) async {
+    if (!_client.jar.isLoggedIn) return false;
+    try {
+      final json = await _client.getJson(
+        'https://api.bilibili.com/x/v2/fav/video/favoured',
+        query: {'aid': aid},
+        withWbi: false,
+      );
+      final data = json['data'];
+      if (data is Map) return data['favoured'] == true;
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 点赞 / 取消点赞
+  ///
+  /// 需要登录且带 csrf（bili_jct）。返回 (成功, 提示语)。
+  Future<ActionResult> like(String bvid, {required bool liked, required int aid}) async {
+    return _postAction(
+      'https://api.bilibili.com/x/web-interface/archive/like',
+      {'bvid': bvid, 'like': liked ? 2 : 1},
+    );
+  }
+
+  /// 投币（multiply: 1 或 2，是否同时点赞）
+  Future<ActionResult> coin(
+    String bvid, {
+    int multiply = 1,
+    bool alsoLike = false,
+  }) async {
+    return _postAction(
+      'https://api.bilibili.com/x/web-interface/coin/add',
+      {
+        'bvid': bvid,
+        'multiply': multiply,
+        'select_like': alsoLike ? 1 : 0,
+      },
+    );
+  }
+
+  /// 收藏到默认收藏夹
+  Future<ActionResult> favorite(int aid) async {
+    // 先找默认收藏夹
+    final mid = _client.jar.userId ?? '';
+    if (mid.isEmpty) {
+      return const ActionResult(ok: false, message: '请先登录');
+    }
+    int folderId = 0;
+    try {
+      final list = await _client.getJson(
+        'https://api.bilibili.com/x/v3/fav/folder/created/list-all',
+        query: {'up_mid': mid},
+        withWbi: false,
+        acceptCodes: const {-101, -400},
+      );
+      final data = list['data'];
+      if (data is Map) {
+        final arr = data['list'];
+        if (arr is List && arr.isNotEmpty) {
+          folderId = _asInt((arr.first as Map)['id']);
+        }
+      }
+    } catch (_) {}
+
+    return _postAction(
+      'https://api.bilibili.com/x/v3/fav/resource/deal',
+      {
+        'rid': aid,
+        'type': 2,
+        'add_media_ids': folderId > 0 ? '$folderId' : '',
+        'del_media_ids': '',
+      },
+    );
+  }
+
+  /// 统一处理需要 csrf 的写操作
+  Future<ActionResult> _postAction(String url, Map<String, dynamic> body) async {
+    final csrf = _client.jar['bili_jct'] ?? '';
+    if (!_client.jar.isLoggedIn || csrf.isEmpty) {
+      return const ActionResult(ok: false, message: '请先登录');
+    }
+    try {
+      final json = await _client.postForm(
+        url,
+        {...body, 'csrf': csrf},
+        acceptCodes: const {-101, -111},
+      );
+      final code = _asInt(json['code']);
+      if (code == 0) return const ActionResult(ok: true);
+      return ActionResult(
+        ok: false,
+        message: json['message']?.toString() ?? '操作失败',
+      );
+    } catch (e) {
+      return ActionResult(ok: false, message: e.toString());
+    }
+  }
+
+  // ------------------------------------------------------------ UP 空间
+
+  /// UP 主空间信息
+  Future<UpProfile> upProfile(int mid) async {
+    final json = await _client.getJson(
+      'https://api.bilibili.com/x/space/wbi/acc/info',
+      query: {
+        'mid': mid,
+        'platform': 'web',
+        'web_location': 1550101,
+      },
+    );
+    final data = json['data'];
+    if (data is! Map<String, dynamic>) {
+      throw BiliException('UP 主信息解析失败');
+    }
+    return UpProfile.fromJson(data);
+  }
+
+  /// UP 主投稿列表
+  Future<List<SpaceVideo>> upVideos(
+    int mid, {
+    int page = 1,
+    int ps = 20,
+    String keyword = '',
+  }) async {
+    final json = await _client.getJson(
+      'https://api.bilibili.com/x/space/wbi/arc/search',
+      query: {
+        'mid': mid,
+        'pn': page,
+        'ps': ps,
+        'order': 'pubdate',
+        'platform': 'web',
+        'web_location': 1550101,
+        'keyword': keyword,
+      },
+    );
+    final data = json['data'];
+    if (data is! Map) return const [];
+    final list = data['list'];
+    if (list is! Map) return const [];
+    final vlist = list['vlist'];
+    if (vlist is! List) return const [];
+    final out = <SpaceVideo>[];
+    for (final raw in vlist) {
+      if (raw is Map<String, dynamic>) out.add(SpaceVideo.fromJson(raw));
     }
     return out;
   }
+
+  static int _asInt(dynamic v) {
+    if (v is int) return v;
+    if (v is num) return v.toInt();
+    if (v is String) return int.tryParse(v) ?? 0;
+    return 0;
+  }
+}
+
+/// 写操作结果
+class ActionResult {
+  const ActionResult({required this.ok, this.message});
+  final bool ok;
+  final String? message;
 }
 
 class QrLoginSession {
@@ -274,50 +490,6 @@ class QrLoginResult {
   const QrLoginResult({required this.status, this.message});
   final QrLoginStatus status;
   final String? message;
-}
-
-class CommentItem {
-  const CommentItem({
-    required this.rpid,
-    required this.author,
-    required this.avatar,
-    required this.content,
-    required this.like,
-    required this.ctime,
-    required this.replyCount,
-  });
-
-  final int rpid;
-  final String author;
-  final String avatar;
-  final String content;
-  final int like;
-  final int ctime;
-  final int replyCount;
-
-  factory CommentItem.fromJson(Map<String, dynamic> json) {
-    final member = json['member'];
-    final content = json['content'];
-    final ctime = json['ctime'];
-    final like = json['like'];
-    final rcount = json['rcount'];
-    return CommentItem(
-      rpid: _i(json['rpid']),
-      author: member is Map ? (member['uname']?.toString() ?? '') : '',
-      avatar: member is Map ? FeedItem.httpsUrl(member['avatar']?.toString() ?? '') : '',
-      content: content is Map ? (content['message']?.toString() ?? '') : '',
-      like: _i(like),
-      ctime: _i(ctime),
-      replyCount: _i(rcount),
-    );
-  }
-
-  static int _i(dynamic v) {
-    if (v is int) return v;
-    if (v is num) return v.toInt();
-    if (v is String) return int.tryParse(v) ?? 0;
-    return 0;
-  }
 }
 
 /// 从登录回调 URL 中提取 cookie 并写入罐子

@@ -48,6 +48,11 @@ class CookieJar {
 
   bool get isLoggedIn => (_cookies['SESSDATA'] ?? '').isNotEmpty;
 
+  /// 是否可以发起写操作：需要 SESSDATA 和 bili_jct（csrf）
+  bool get canWrite =>
+      (_cookies['SESSDATA'] ?? '').isNotEmpty &&
+      (_cookies['bili_jct'] ?? '').isNotEmpty;
+
   String? get userId => _cookies['DedeUserID'];
 
   Future<void> setAll(Map<String, String> values) async {
@@ -354,6 +359,41 @@ class BiliClient {
       throw BiliException('HTTP $status', code: -status);
     }
     return resp.data ?? const <int>[];
+  }
+
+  /// POST 表单（点赞 / 投币 / 收藏等写操作，必须带 csrf）
+  Future<Map<String, dynamic>> postForm(
+    String url,
+    Map<String, dynamic> body, {
+    Set<int> acceptCodes = const {},
+  }) async {
+    final resp = await _dio.post<String>(
+      url,
+      data: body,
+      options: Options(
+        contentType: Headers.formUrlEncodedContentType,
+        validateStatus: (_) => true,
+      ),
+    );
+    final status = resp.statusCode ?? 0;
+    if (status < 200 || status >= 300) {
+      throw BiliException('HTTP $status', code: -status);
+    }
+    final text = resp.data ?? '';
+    if (text.isEmpty) throw BiliException('空响应');
+    final decoded = jsonDecode(text);
+    if (decoded is! Map<String, dynamic>) {
+      throw BiliException('响应格式异常');
+    }
+    final code = decoded['code'];
+    final codeValue = code is int ? code : null;
+    if (!isEnvelopeOk(codeValue, acceptCodes)) {
+      throw BiliException(
+        decoded['message']?.toString() ?? '操作失败',
+        code: codeValue,
+      );
+    }
+    return decoded;
   }
 }
 
