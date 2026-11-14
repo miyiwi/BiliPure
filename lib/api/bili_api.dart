@@ -116,6 +116,29 @@ class BiliApi {
     return out;
   }
 
+  /// 视频标签（简介页展示）
+  Future<List<String>> tags(String bvid) async {
+    try {
+      final json = await _client.getJson(
+        'https://api.bilibili.com/x/tag/archive/tags',
+        query: {'bvid': bvid},
+        withWbi: false,
+      );
+      final data = json['data'];
+      if (data is! List) return const [];
+      final out = <String>[];
+      for (final raw in data) {
+        if (raw is Map) {
+          final name = raw['tag_name']?.toString() ?? '';
+          if (name.isNotEmpty) out.add(name);
+        }
+      }
+      return out;
+    } catch (_) {
+      return const [];
+    }
+  }
+
   /// 取播放地址
   ///
   /// 关键点：`fnval` 位掩码决定返回形态
