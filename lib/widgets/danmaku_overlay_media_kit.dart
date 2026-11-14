@@ -2,22 +2,18 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
-import 'package:video_player/video_player.dart';
 
 import '../models/danmaku.dart';
+import '../services/bili_player.dart';
 
-/// 弹幕渲染层
+/// 弹幕渲染层（media_kit 版）
 ///
-/// 设计要点：
-/// - 所有弹幕在加载时预先完成排版（TextPainter + 轨道分配），播放时只做位置计算，
-///   避免每帧重新布局导致的掉帧。
-/// - 位置直接由播放器的 position 推导，不依赖独立的 AnimationController，
-///   所以暂停 / 拖动进度条时弹幕会精确同步。
-/// - 滚动弹幕沿用「轨道占用时间」的贪心分配，防止同轨重叠。
-class DanmakuOverlay extends StatefulWidget {
-  const DanmakuOverlay({
+/// 与 video_player 版的区别：位置来源从 `VideoPlayerController.value.position`
+/// 换成 media_kit 的 `Player.stream.position`。其余排版 / 轨道分配逻辑不变。
+class DanmakuOverlayMediaKit extends StatefulWidget {
+  const DanmakuOverlayMediaKit({
     super.key,
-    required this.controller,
+    required this.player,
     required this.danmakus,
     this.enabled = true,
     this.opacity = 0.9,
@@ -25,27 +21,22 @@ class DanmakuOverlay extends StatefulWidget {
     this.areaRatio = 0.75,
   });
 
-  final VideoPlayerController controller;
+  final BiliPlayer player;
   final List<Danmaku> danmakus;
   final bool enabled;
   final double opacity;
-
-  /// 字体缩放
   final double fontScale;
 
-  /// 弹幕最多占据画面高度的比例（避免挡脸）
+  /// 弹幕最多占据画面高度的比例
   final double areaRatio;
 
   @override
-  State<DanmakuOverlay> createState() => _DanmakuOverlayState();
+  State<DanmakuOverlayMediaKit> createState() => _DanmakuOverlayMediaKitState();
 }
 
-class _DanmakuOverlayState extends State<DanmakuOverlay>
+class _DanmakuOverlayMediaKitState extends State<DanmakuOverlayMediaKit>
     with SingleTickerProviderStateMixin {
-  /// 滚动弹幕从右边缘走到左边缘所需秒数
   static const double _travelSeconds = 8.0;
-
-  /// 顶部 / 底部固定弹幕停留秒数
   static const double _fixedSeconds = 4.0;
 
   List<_Prepared> _items = const [];
@@ -53,8 +44,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
   Size _preparedSize = Size.zero;
   double _preparedScale = 0;
 
-  /// video_player 的位置回调大约 200ms 一次，直接用它驱动会让弹幕一跳一跳。
-  /// 这里用 Ticker 做插值：记住最后一次真实位置，再按流逝时间外推。
+  /// media_kit 的 position 流约 100~200ms 一次，用 Ticker 插值保证 60fps
   Ticker? _ticker;
   Duration _basePosition = Duration.zero;
   Duration _baseAt = Duration.zero;
@@ -63,23 +53,22 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
   @override
   void initState() {
     super.initState();
-    widget.controller.addListener(_onControllerChanged);
-    _basePosition = widget.controller.value.position;
+    _basePosition = widget.player.position;
     _display = _basePosition;
     _baseAt = _now();
     _ticker = createTicker(_onTick)..start();
+    // 监听 media_kit 的位置流，重置插值基准
+    widget.player.positionStream.listen((p) {
+      if (!mounted) return;
+      _basePosition = p;
+      _baseAt = _now();
+      _display = p;
+    });
   }
 
   @override
-  void didUpdateWidget(covariant DanmakuOverlay oldWidget) {
+  void didUpdateWidget(covariant DanmakuOverlayMediaKit oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.controller != widget.controller) {
-      oldWidget.controller.removeListener(_onControllerChanged);
-      widget.controller.addListener(_onControllerChanged);
-      _basePosition = widget.controller.value.position;
-      _display = _basePosition;
-      _baseAt = _now();
-    }
     if (!identical(oldWidget.danmakus, widget.danmakus)) {
       _preparedFor = null;
     }
@@ -88,33 +77,21 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
   @override
   void dispose() {
     _ticker?.dispose();
-    widget.controller.removeListener(_onControllerChanged);
     super.dispose();
   }
 
-  Duration _now() =>
-      Duration(microseconds: DateTime.now().microsecondsSinceEpoch);
-
-  /// 播放器位置真正更新时才重置插值基准
-  void _onControllerChanged() {
-    final pos = widget.controller.value.position;
-    if (pos != _basePosition) {
-      _basePosition = pos;
-      _baseAt = _now();
-      _display = pos;
-    }
-  }
+  Duration _now() => Duration(microseconds: DateTime.now().microsecondsSinceEpoch);
 
   void _onTick(Duration _) {
     if (!mounted || !widget.enabled) return;
-    final value = widget.controller.value;
+    final playing = widget.player.isPlaying;
     Duration next;
-    if (value.isPlaying) {
+    if (playing) {
       next = _basePosition + (_now() - _baseAt);
-      final total = value.duration;
+      final total = widget.player.duration;
       if (total > Duration.zero && next > total) next = total;
     } else {
-      next = value.position;
+      next = widget.player.position;
     }
     if (next != _display) {
       _display = next;
@@ -136,8 +113,8 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
     final baseFont = 16.0 * widget.fontScale;
     final lineHeight = baseFont * 1.5;
     final laneHeight = lineHeight + 4;
-    // 滚动弹幕只占用上半部分区域
-    final scrollLanes = math.max(1, (size.height * widget.areaRatio / laneHeight).floor());
+    final scrollLanes =
+        math.max(1, (size.height * widget.areaRatio / laneHeight).floor());
     final fixedLanes = math.max(1, math.min(4, (size.height * 0.4 / laneHeight).floor()));
 
     final laneFree = List<double>.filled(scrollLanes, 0);
@@ -151,7 +128,6 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
       final width = tp.width;
 
       if (dm.isScroll) {
-        // 找一条已经空出来的轨道
         var lane = -1;
         for (var i = 0; i < scrollLanes; i++) {
           if (laneFree[i] <= dm.time) {
@@ -160,32 +136,23 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
           }
         }
         if (lane == -1) {
-          // 没有空轨道，放到最早空闲的那条（允许轻微重叠）
           var best = 0;
           for (var i = 1; i < scrollLanes; i++) {
             if (laneFree[i] < laneFree[best]) best = i;
           }
           lane = best;
         }
-        // 占轨时间 = 弹幕完全离开右边缘所需时间
         final occupy = (width + 40) / (size.width + width) * _travelSeconds;
         laneFree[lane] = dm.time + occupy + 0.35;
-        items.add(_Prepared(dm: dm, painter: tp, lane: lane, width: width, laneHeight: laneHeight));
+        items.add(_Prepared(
+          dm: dm,
+          painter: tp,
+          lane: lane,
+          width: width,
+          laneHeight: laneHeight,
+        ));
       } else if (dm.isTop) {
-        var lane = -1;
-        for (var i = 0; i < fixedLanes; i++) {
-          if (topFree[i] <= dm.time) {
-            lane = i;
-            break;
-          }
-        }
-        if (lane == -1) {
-          var best = 0;
-          for (var i = 1; i < fixedLanes; i++) {
-            if (topFree[i] < topFree[best]) best = i;
-          }
-          lane = best;
-        }
+        var lane = _pickLane(topFree, dm.time);
         topFree[lane] = dm.time + _fixedSeconds;
         items.add(_Prepared(
           dm: dm,
@@ -196,20 +163,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
           fixedTop: true,
         ));
       } else if (dm.isBottom) {
-        var lane = -1;
-        for (var i = 0; i < fixedLanes; i++) {
-          if (bottomFree[i] <= dm.time) {
-            lane = i;
-            break;
-          }
-        }
-        if (lane == -1) {
-          var best = 0;
-          for (var i = 1; i < fixedLanes; i++) {
-            if (bottomFree[i] < bottomFree[best]) best = i;
-          }
-          lane = best;
-        }
+        var lane = _pickLane(bottomFree, dm.time);
         bottomFree[lane] = dm.time + _fixedSeconds;
         items.add(_Prepared(
           dm: dm,
@@ -223,6 +177,17 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
     }
     items.sort((a, b) => a.dm.time.compareTo(b.dm.time));
     _items = items;
+  }
+
+  int _pickLane(List<double> free, double time) {
+    for (var i = 0; i < free.length; i++) {
+      if (free[i] <= time) return i;
+    }
+    var best = 0;
+    for (var i = 1; i < free.length; i++) {
+      if (free[i] < free[best]) best = i;
+    }
+    return best;
   }
 
   TextPainter _layout(Danmaku dm, double fontSize) {
@@ -256,9 +221,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
     if (!widget.enabled || widget.danmakus.isEmpty) {
       return const SizedBox.shrink();
     }
-    final value = widget.controller.value;
     final position = _display.inMilliseconds / 1000.0;
-    if (value.hasError && !value.isInitialized) return const SizedBox.shrink();
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -326,13 +289,10 @@ class _DanmakuPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size canvasSize) {
     if (items.isEmpty || position <= 0) return;
-
     final maxScrollY = canvasSize.height * areaRatio;
 
     for (final item in items) {
-      final start = item.dm.time;
-      final elapsed = position - start;
-
+      final elapsed = position - item.dm.time;
       if (item.fixedTop) {
         if (elapsed < 0 || elapsed > fixedSeconds) continue;
         final left = (canvasSize.width - item.width) / 2;
@@ -345,8 +305,7 @@ class _DanmakuPainter extends CustomPainter {
         final left = (canvasSize.width - item.width) / 2;
         if (left < 0) continue;
         final top = canvasSize.height - 10.0 - (item.lane + 1) * item.laneHeight;
-        final topGuard = canvasSize.height * (1 - areaRatio) + 10;
-        if (top < topGuard) continue;
+        if (top < canvasSize.height * (1 - areaRatio) + 10) continue;
         _paintOne(canvas, item, left, top, _fade(elapsed, fixedSeconds));
       } else {
         if (elapsed < 0 || elapsed > travelSeconds) continue;
@@ -360,8 +319,8 @@ class _DanmakuPainter extends CustomPainter {
   }
 
   double _fade(double elapsed, double total) {
-    final fadeIn = 0.15;
-    final fadeOut = 0.4;
+    const fadeIn = 0.15;
+    const fadeOut = 0.4;
     if (elapsed < fadeIn) return (elapsed / fadeIn).clamp(0.0, 1.0);
     final remain = total - elapsed;
     if (remain < fadeOut) return (remain / fadeOut).clamp(0.0, 1.0);
@@ -383,8 +342,6 @@ class _DanmakuPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _DanmakuPainter old) {
-    return old.position != position ||
-        !identical(old.items, items) ||
-        old.size != size;
+    return old.position != position || !identical(old.items, items) || old.size != size;
   }
 }

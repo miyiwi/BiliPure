@@ -5,9 +5,12 @@ import 'api/bili_api.dart';
 import 'pages/home/home_page.dart';
 import 'pages/mine/mine_page.dart';
 import 'pages/popular/popular_page.dart';
+import 'services/bili_player.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  // media_kit（libmpv）必须在 runApp 之前初始化
+  ensureMediaKitInitialized();
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
       statusBarColor: Colors.transparent,

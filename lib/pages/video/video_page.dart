@@ -3,7 +3,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:video_player/video_player.dart';
+import 'package:media_kit_video/media_kit_video.dart';
 
 import '../../api/bili_api.dart';
 import '../../core/format.dart';
@@ -12,19 +12,20 @@ import '../../models/danmaku.dart';
 import '../../models/feed_item.dart';
 import '../../models/play_info.dart';
 import '../../models/video_detail.dart';
+import '../../services/bili_player.dart';
 import '../../services/danmaku_service.dart';
-import '../../widgets/danmaku_overlay.dart';
+import '../../widgets/danmaku_overlay_media_kit.dart';
 import '../../widgets/error_view.dart';
 import '../../widgets/video_card.dart';
 import '../space/space_page.dart';
 
 /// 视频播放页
 ///
-/// 结构对齐官方客户端：
-/// - 顶部播放器，暂停时全屏任意位置上下滑动即可收缩为「顶部小窗」
-/// - 展开高度以视频原始比例高度为上限，永远不会超过
-/// - 下半部分是「简介 / 评论」两个 Tab
-///   简介页放视频简介、标签、相关推荐；评论页单独承载评论列表
+/// 布局参照官方客户端截图：
+/// - 播放器在上，控制栏在底部（播放/下一集/弹幕/输入框/倍速/清晰度）
+/// - 右上有「关注/收藏/投币/点赞/分享/更多」入口
+/// - 下方是「简介 / 评论」Tab
+/// - 暂停时可上下滑动收缩为顶部小窗，展开不超过视频原始高度
 class VideoPage extends StatefulWidget {
   const VideoPage({
     super.key,
@@ -44,27 +45,35 @@ class VideoPage extends StatefulWidget {
 }
 
 class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMixin {
-  VideoPlayerController? _controller;
+  late final BiliPlayer _player;
   VideoDetail? _detail;
   PlayInfo? _playInfo;
   List<Danmaku> _danmakus = const [];
   List<FeedItem> _related = const [];
   List<String> _tags = const [];
 
+  StreamSubscription<bool>? _playingSub;
+  StreamSubscription<Duration>? _posSub;
+  StreamSubscription<Duration>? _durSub;
+  StreamSubscription<bool>? _bufferingSub;
+
+  bool _playing = false;
+  Duration _position = Duration.zero;
+  Duration _duration = Duration.zero;
+  bool _buffering = false;
+
   bool _loading = true;
   String? _error;
   int _currentCid = 0;
   int _currentPageIndex = 0;
   int _selectedQuality = 64;
+  double _rate = 1.0;
 
   bool _danmakuOn = true;
   bool _showControls = true;
   Timer? _hideTimer;
 
-  /// 播放器高度。0 表示还没按视频比例算过。
   double _playerHeight = 0;
-
-  /// 收缩动画用
   bool _collapsing = false;
 
   // 三连状态
@@ -83,32 +92,48 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
   bool _commentHasMore = true;
   bool _commentsLoaded = false;
 
-  // 全屏
   bool _fullscreen = false;
 
-  // 手势
   Timer? _longPressTimer;
   bool _longPressFired = false;
   DateTime _lastTap = DateTime.fromMillisecondsSinceEpoch(0);
 
   late TabController _tabController;
 
-  /// 播放器收缩后的高度（顶部小窗）
   static const double _miniHeight = 56;
 
   @override
   void initState() {
     super.initState();
+    ensureMediaKitInitialized();
+    _player = BiliPlayer();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     _tabController = TabController(length: 2, vsync: this);
     _tabController.addListener(() {
       if (!mounted) return;
       setState(() {});
-      // 切到评论页才去拉评论，避免浪费请求
       if (_tabController.index == 1 && !_commentsLoaded) {
         _loadComments(reset: true);
       }
     });
+
+    _playingSub = _player.playingStream.listen((v) {
+      if (!mounted) return;
+      setState(() => _playing = v);
+    });
+    _posSub = _player.positionStream.listen((p) {
+      if (!mounted) return;
+      setState(() => _position = p);
+    });
+    _durSub = _player.durationStream.listen((d) {
+      if (!mounted) return;
+      setState(() => _duration = d);
+    });
+    _bufferingSub = _player.bufferingStream.listen((b) {
+      if (!mounted) return;
+      setState(() => _buffering = b);
+    });
+
     _currentCid = widget.cid ?? 0;
     _load();
   }
@@ -117,9 +142,13 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
   void dispose() {
     _hideTimer?.cancel();
     _longPressTimer?.cancel();
+    _playingSub?.cancel();
+    _posSub?.cancel();
+    _durSub?.cancel();
+    _bufferingSub?.cancel();
     _tabController.dispose();
     SystemChrome.setPreferredOrientations(DeviceOrientation.values);
-    _controller?.dispose();
+    _player.dispose();
     super.dispose();
   }
 
@@ -189,20 +218,47 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
 
   Future<void> _loadPlay(int cid) async {
     if (cid <= 0) throw Exception('找不到视频分 P');
-    final info = await BiliApi.instance.playUrl(
-      bvid: widget.bvid,
-      cid: cid,
-      qn: _selectedQuality,
-    );
+    // 优先要 DASH：media_kit 能合并音视频轨，清晰度上限更高
+    PlayInfo info;
+    try {
+      info = await BiliApi.instance.playUrl(
+        bvid: widget.bvid,
+        cid: cid,
+        qn: _selectedQuality,
+        preferDash: true,
+      );
+      if (!info.isPlayable) throw Exception('DASH 不可用');
+    } catch (_) {
+      // 退回整段 mp4
+      info = await BiliApi.instance.playUrl(
+        bvid: widget.bvid,
+        cid: cid,
+        qn: _selectedQuality,
+      );
+    }
     if (!mounted) return;
     setState(() {
       _playInfo = info;
       _selectedQuality = info.quality;
     });
-    await _startPlayer(info);
+    await _openMedia(info);
     if (!mounted) return;
     setState(() => _loading = false);
     unawaited(_loadDanmaku(cid));
+  }
+
+  Future<void> _openMedia(PlayInfo info) async {
+    if (info.isDash && info.dashVideoUrl.isNotEmpty) {
+      await _player.open(
+        videoUrl: info.dashVideoUrl,
+        audioUrl: info.dashAudioUrl.isEmpty ? null : info.dashAudioUrl,
+      );
+    } else if (info.urls.isNotEmpty) {
+      await _player.open(videoUrl: info.urls.first);
+    } else {
+      throw Exception('播放地址为空');
+    }
+    await _player.setRate(_rate);
   }
 
   Future<void> _loadDanmaku(int cid) async {
@@ -211,53 +267,15 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
     setState(() => _danmakus = list);
   }
 
-  Future<void> _startPlayer(PlayInfo info) async {
-    final old = _controller;
-    _controller = null;
-    await old?.dispose();
+  // ------------------------------------------------------------- 手势
 
-    if (info.urls.isEmpty) {
-      if (info.isDash) {
-        throw Exception('该视频仅提供 DASH 分离流，当前版本暂不支持');
-      }
-      throw Exception('播放地址为空');
-    }
-
-    final uri = Uri.parse(info.urls.first);
-    final controller = VideoPlayerController.networkUrl(
-      uri,
-      httpHeaders: const {
-        // CDN 会校验 UA，缺省 UA 会返回 403
-        'Referer': 'https://www.bilibili.com/',
-        'User-Agent':
-            'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
-            'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-      },
-      videoPlayerOptions: VideoPlayerOptions(mixWithOthers: false),
-    );
-    await controller.initialize();
-    // 监听器必须 setState，否则暂停后按钮图标不会更新
-    controller.addListener(_onPlayerTick);
-    await controller.play();
-    if (!mounted) {
-      await controller.dispose();
-      return;
-    }
-    setState(() {
-      _controller = controller;
-      _playerHeight = 0; // 重新按比例算
-    });
-    _scheduleHide();
-  }
-
-  void _onPlayerTick() {
-    if (!mounted) return;
-    final c = _controller;
-    if (c == null) return;
-    setState(() {});
-    if (c.value.isCompleted) {
+  void _togglePlay() {
+    _player.playOrPause();
+    setState(() => _showControls = true);
+    if (_playing) {
       _hideTimer?.cancel();
-      if (!_showControls) setState(() => _showControls = true);
+    } else {
+      _scheduleHide();
     }
   }
 
@@ -265,31 +283,9 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
     _hideTimer?.cancel();
     _hideTimer = Timer(const Duration(seconds: 3), () {
       if (!mounted) return;
-      if (_controller?.value.isPlaying != true) return;
+      if (!_playing) return;
       setState(() => _showControls = false);
     });
-  }
-
-  /// 视频原始比例下的自然高度（展开上限）
-  double _naturalHeight(double videoRatio, double width) {
-    final safeRatio = videoRatio <= 0 ? 16 / 9 : videoRatio;
-    return width / safeRatio;
-  }
-
-  // ------------------------------------------------------------- 手势
-
-  void _togglePlay() {
-    final c = _controller;
-    if (c == null) return;
-    if (c.value.isPlaying) {
-      c.pause();
-      setState(() => _showControls = true);
-      _hideTimer?.cancel();
-    } else {
-      c.play();
-      _scheduleHide();
-    }
-    setState(() {});
   }
 
   void _onTapUp() {
@@ -320,45 +316,33 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
 
   void _onLongPressEnd() {
     _longPressTimer?.cancel();
-    if (mounted) {
-      Future<void>.delayed(const Duration(milliseconds: 60), () {
-        _longPressFired = false;
-      });
-    }
+    Future<void>.delayed(const Duration(milliseconds: 60), () {
+      _longPressFired = false;
+    });
   }
 
-  /// 暂停时上下滑动收缩 / 展开播放器
-  ///
-  /// 官方行为：暂停状态下在页面任意位置竖向滑动都能收缩，
-  /// 展开高度不超过视频原始比例高度。
-  void _onVerticalDragStart(DragStartDetails d, double natural) {
-    // 播放中不响应收缩，避免误触
-    if (_controller?.value.isPlaying == true) return;
-    // 展开上限永远不超过视频原始比例高度
-    if (_playerHeight <= 0) _playerHeight = natural;
+  double _naturalHeight(double videoRatio, double width) {
+    final safeRatio = videoRatio <= 0 ? 16 / 9 : videoRatio;
+    return width / safeRatio;
   }
 
   void _onVerticalDragUpdate(DragUpdateDetails d, double natural) {
-    if (_controller?.value.isPlaying == true) return;
+    if (_playing) return;
     if (_playerHeight <= 0) _playerHeight = natural;
-    final next = (_playerHeight - d.delta.dy);
     final upper = math.max(_miniHeight, natural).toDouble();
     setState(() {
-      _playerHeight = next.clamp(_miniHeight, upper).toDouble();
+      _playerHeight = (_playerHeight - d.delta.dy).clamp(_miniHeight, upper).toDouble();
     });
   }
 
   void _onVerticalDragEnd(DragEndDetails d, double natural) {
-    if (_controller?.value.isPlaying == true) return;
-    if (_playerHeight <= 0) return;
-    final velocity = d.primaryVelocity ?? 0;
-    // 快速上滑 → 直接收成小窗；快速下滑 → 展开
-    if (velocity < -300) {
+    if (_playing || _playerHeight <= 0) return;
+    final v = d.primaryVelocity ?? 0;
+    if (v < -300) {
       _animateTo(_miniHeight, natural);
-    } else if (velocity > 300) {
+    } else if (v > 300) {
       _animateTo(natural, natural);
     } else {
-      // 松手时按位置吸附
       final mid = (_miniHeight + natural) / 2;
       _animateTo(_playerHeight < mid ? _miniHeight : natural, natural);
     }
@@ -366,56 +350,52 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
 
   void _animateTo(double target, double natural) {
     final from = _playerHeight;
-    // math.max 返回 num，这里显式转成 double
     final upper = math.max(_miniHeight, natural).toDouble();
-    final clamped = target.clamp(_miniHeight, upper).toDouble();
+    final to = target.clamp(_miniHeight, upper).toDouble();
     final start = DateTime.now();
-    const duration = Duration(milliseconds: 180);
+    const dur = Duration(milliseconds: 180);
     setState(() => _collapsing = true);
     Timer.periodic(const Duration(milliseconds: 16), (timer) {
       if (!mounted) {
         timer.cancel();
         return;
       }
-      final t = DateTime.now().difference(start).inMilliseconds / duration.inMilliseconds;
+      final t = DateTime.now().difference(start).inMilliseconds / dur.inMilliseconds;
       if (t >= 1) {
         timer.cancel();
         setState(() {
-          _playerHeight = clamped;
+          _playerHeight = to;
           _collapsing = false;
         });
         return;
       }
-      // easeOutCubic
       final e = 1 - math.pow(1 - t, 3);
-      setState(() => _playerHeight = from + (clamped - from) * e);
+      setState(() => _playerHeight = from + (to - from) * e);
     });
   }
 
-  // ------------------------------------------------------------- 三连
+  // ------------------------------------------------------------- 交互
 
   Future<void> _tripleAction() async {
     if (_interacting) return;
     _interacting = true;
     try {
       final api = BiliApi.instance;
-      final results = <String>[];
+      final done = <String>[];
 
       final like = await api.like(widget.bvid, liked: true, aid: _detail?.aid ?? 0);
       if (like.ok) {
         if (!_liked) setState(() => _likedCount += 1);
         setState(() => _liked = true);
-        results.add('点赞');
+        done.add('点赞');
       }
-
       if (_coinCount < 2) {
         final coin = await api.coin(widget.bvid, multiply: 1);
         if (coin.ok) {
           setState(() => _coinCount += 1);
-          results.add('投币');
+          done.add('投币');
         }
       }
-
       if (!_faved && (_detail?.aid ?? 0) > 0) {
         final fav = await api.favorite(_detail!.aid);
         if (fav.ok) {
@@ -423,17 +403,15 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
             _faved = true;
             _favCount += 1;
           });
-          results.add('收藏');
+          done.add('收藏');
         }
       }
-
       if (!mounted) return;
-      if (results.isEmpty) {
+      if (done.isEmpty) {
         final canWrite = await BiliApi.instance.canWrite();
-        // 官方文案：「登录后即可一键三连」
         _toast(canWrite ? '操作未完成，请稍后重试' : '登录后即可一键三连');
       } else {
-        _toast('已${results.join('、')}');
+        _toast('已${done.join('、')}');
       }
     } finally {
       _interacting = false;
@@ -454,15 +432,17 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
   }
 
   Future<void> _toggleLike() async {
-    final api = BiliApi.instance;
     final target = !_liked;
-    final r = await api.like(widget.bvid, liked: target, aid: _detail?.aid ?? 0);
+    final r = await BiliApi.instance.like(
+      widget.bvid,
+      liked: target,
+      aid: _detail?.aid ?? 0,
+    );
     if (!mounted) return;
     if (r.ok) {
       setState(() {
         _liked = target;
-        _likedCount += target ? 1 : -1;
-        if (_likedCount < 0) _likedCount = 0;
+        _likedCount = (_likedCount + (target ? 1 : -1)).clamp(0, 1 << 30);
       });
     } else {
       _toast(r.message ?? '操作失败');
@@ -553,8 +533,8 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
 
   Future<void> _switchQuality(int qn) async {
     if (qn == _selectedQuality) return;
-    final pos = _controller?.value.position ?? Duration.zero;
-    final wasPlaying = _controller?.value.isPlaying ?? false;
+    final pos = _position;
+    final wasPlaying = _playing;
     setState(() {
       _selectedQuality = qn;
       _loading = true;
@@ -564,14 +544,14 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
         bvid: widget.bvid,
         cid: _currentCid,
         qn: qn,
+        preferDash: true,
       );
       if (!mounted) return;
       setState(() => _playInfo = info);
-      await _startPlayer(info);
-      final c = _controller;
-      if (c != null && pos > Duration.zero) {
-        await c.seekTo(pos);
-        if (wasPlaying) await c.play();
+      await _openMedia(info);
+      if (pos > Duration.zero) {
+        await _player.seek(pos);
+        if (wasPlaying) await _player.play();
       }
       if (mounted) setState(() => _loading = false);
     } catch (e) {
@@ -619,25 +599,50 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
       ]);
       await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     } else {
-      await SystemChrome.setPreferredOrientations([
-        DeviceOrientation.portraitUp,
-      ]);
+      await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
       await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     }
+  }
+
+  void _showRateSheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.black87,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(12),
+              child: Text('倍速', style: TextStyle(color: Colors.white70)),
+            ),
+            for (final r in kPlaybackRates)
+              ListTile(
+                dense: true,
+                title: Text(
+                  rateLabel(r),
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: r == _rate ? const Color(0xFFFB7299) : Colors.white,
+                  ),
+                ),
+                onTap: () async {
+                  await _player.setRate(r);
+                  if (mounted) setState(() => _rate = r);
+                  if (context.mounted) Navigator.pop(context);
+                },
+              ),
+          ],
+        ),
+      ),
+    );
   }
 
   // ------------------------------------------------------------- 构建
 
   @override
   Widget build(BuildContext context) {
-    final c = _controller;
-    final videoRatio =
-        c != null && c.value.isInitialized && c.value.aspectRatio > 0
-            ? c.value.aspectRatio
-            : 16 / 9;
-
     return AnnotatedRegion<SystemUiOverlayStyle>(
-      // 播放页黑底，状态栏图标必须白色
       value: const SystemUiOverlayStyle(
         statusBarColor: Colors.transparent,
         statusBarIconBrightness: Brightness.light,
@@ -647,14 +652,22 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
       ),
       child: Scaffold(
         backgroundColor: Colors.black,
-        body: _fullscreen
-            ? _buildFullscreen(c, videoRatio)
-            : _buildNormal(c, videoRatio),
+        body: _fullscreen ? _buildFullscreen() : _buildNormal(),
       ),
     );
   }
 
-  Widget _buildFullscreen(VideoPlayerController? c, double ratio) {
+  /// 视频宽高比
+  ///
+  /// media_kit 把宽高比放在 player.state.videoParams.aspect，
+  /// 拿不到时按 16:9 兜底。
+  double get _videoRatio {
+    final a = _player.player.state.videoParams.aspect;
+    if (a != null && a > 0) return a;
+    return 16 / 9;
+  }
+
+  Widget _buildFullscreen() {
     return GestureDetector(
       onTapUp: (_) => _onTapUp(),
       onLongPressStart: (_) => _onLongPressStart(),
@@ -664,33 +677,33 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
         child: Stack(
           fit: StackFit.expand,
           children: [
-            Center(
-              child: c != null && c.value.isInitialized
-                  ? AspectRatio(aspectRatio: ratio, child: VideoPlayer(c))
-                  : const CircularProgressIndicator(color: Colors.white),
+            Center(child: _buildVideo()),
+            DanmakuOverlayMediaKit(
+              player: _player,
+              danmakus: _danmakus,
+              enabled: _danmakuOn,
             ),
-            if (c != null && c.value.isInitialized)
-              DanmakuOverlay(
-                controller: c,
-                danmakus: _danmakus,
-                enabled: _danmakuOn,
-              ),
-            if (_showControls && c != null && c.value.isInitialized)
-              _buildControls(c, fullscreen: true),
+            if (_showControls) _buildControls(fullscreen: true),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildNormal(VideoPlayerController? c, double ratio) {
-    final width = MediaQuery.sizeOf(context).width;
-    // 展开上限 = 视频原始比例高度，绝不会超过
-    final natural = _naturalHeight(ratio, width);
-    if (_playerHeight <= 0) _playerHeight = natural;
-    _playerHeight =
-        _playerHeight.clamp(_miniHeight, math.max(_miniHeight, natural));
+  Widget _buildVideo() {
+    return Video(
+      controller: _player.controller,
+      controls: NoVideoControls,
+      fit: BoxFit.contain,
+    );
+  }
 
+  Widget _buildNormal() {
+    final width = MediaQuery.sizeOf(context).width;
+    final natural = _naturalHeight(_videoRatio, width);
+    if (_playerHeight <= 0) _playerHeight = natural;
+    final upper = math.max(_miniHeight, natural).toDouble();
+    _playerHeight = _playerHeight.clamp(_miniHeight, upper).toDouble();
     final mini = _playerHeight <= _miniHeight + 0.5;
 
     return SafeArea(
@@ -699,7 +712,9 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
         children: [
           GestureDetector(
             behavior: HitTestBehavior.translucent,
-            onVerticalDragStart: (d) => _onVerticalDragStart(d, natural),
+            onTapUp: (_) => _onTapUp(),
+            onLongPressStart: (_) => _onLongPressStart(),
+            onLongPressEnd: (_) => _onLongPressEnd(),
             onVerticalDragUpdate: (d) => _onVerticalDragUpdate(d, natural),
             onVerticalDragEnd: (d) => _onVerticalDragEnd(d, natural),
             child: AnimatedContainer(
@@ -708,9 +723,7 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
               height: _playerHeight,
               width: double.infinity,
               color: Colors.black,
-              child: (_controller?.value.isPlaying ?? false) || !mini
-                  ? _buildPlayerSurface(c, ratio, mini: mini)
-                  : _buildMiniBar(),
+              child: (_playing || !mini) ? _buildPlayerSurface(mini: mini) : _buildMiniBar(),
             ),
           ),
           Expanded(child: _buildBody()),
@@ -719,43 +732,15 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
     );
   }
 
-  /// 收缩成小窗时，播放器只保留一条细栏
   Widget _buildMiniBar() {
-    final c = _controller;
     final title = _detail?.title ?? widget.title;
+    final width = MediaQuery.sizeOf(context).width;
+    final natural = _naturalHeight(_videoRatio, width);
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onTap: () => _animateTo(
-        _naturalHeight(
-          c != null && c.value.isInitialized ? c.value.aspectRatio : 16 / 9,
-          MediaQuery.sizeOf(context).width,
-        ),
-        _naturalHeight(
-          c != null && c.value.isInitialized ? c.value.aspectRatio : 16 / 9,
-          MediaQuery.sizeOf(context).width,
-        ),
-      ),
-      onVerticalDragStart: (d) {
-        final natural = _naturalHeight(
-          c != null && c.value.isInitialized ? c.value.aspectRatio : 16 / 9,
-          MediaQuery.sizeOf(context).width,
-        );
-        _onVerticalDragStart(d, natural);
-      },
-      onVerticalDragUpdate: (d) {
-        final natural = _naturalHeight(
-          c != null && c.value.isInitialized ? c.value.aspectRatio : 16 / 9,
-          MediaQuery.sizeOf(context).width,
-        );
-        _onVerticalDragUpdate(d, natural);
-      },
-      onVerticalDragEnd: (d) {
-        final natural = _naturalHeight(
-          c != null && c.value.isInitialized ? c.value.aspectRatio : 16 / 9,
-          MediaQuery.sizeOf(context).width,
-        );
-        _onVerticalDragEnd(d, natural);
-      },
+      onTap: () => _animateTo(natural, natural),
+      onVerticalDragUpdate: (d) => _onVerticalDragUpdate(d, natural),
+      onVerticalDragEnd: (d) => _onVerticalDragEnd(d, natural),
       child: Container(
         color: Colors.black,
         padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -765,9 +750,7 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
               padding: EdgeInsets.zero,
               constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
               icon: Icon(
-                c?.value.isPlaying == true
-                    ? Icons.pause_circle_filled
-                    : Icons.play_circle_fill,
+                _playing ? Icons.pause_circle_filled : Icons.play_circle_fill,
                 color: Colors.white,
                 size: 24,
               ),
@@ -798,75 +781,50 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
     );
   }
 
-  Widget _buildPlayerSurface(VideoPlayerController? c, double ratio, {bool mini = false}) {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTapUp: (_) => _onTapUp(),
-      onLongPressStart: (_) => _onLongPressStart(),
-      onLongPressEnd: (_) => _onLongPressEnd(),
-      child: ColoredBox(
-        color: Colors.black,
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            Center(
-              child: c != null && c.value.isInitialized
-                  ? AspectRatio(aspectRatio: ratio, child: VideoPlayer(c))
-                  : const Center(
-                      child: CircularProgressIndicator(color: Colors.white),
-                    ),
+  Widget _buildPlayerSurface({bool mini = false}) {
+    return ColoredBox(
+      color: Colors.black,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          Center(child: _buildVideo()),
+          DanmakuOverlayMediaKit(
+            player: _player,
+            danmakus: _danmakus,
+            enabled: _danmakuOn,
+          ),
+          if (_showControls) _buildControls(fullscreen: false),
+          if (_error != null && _detail == null)
+            Container(
+              color: Colors.black54,
+              child: ErrorView(message: _error!, onRetry: _load),
             ),
-            if (c != null && c.value.isInitialized)
-              DanmakuOverlay(
-                controller: c,
-                danmakus: _danmakus,
-                enabled: _danmakuOn,
-              ),
-            if (_showControls && c != null && c.value.isInitialized)
-              _buildControls(c, fullscreen: false),
-            if (_error != null && c == null)
-              Container(
-                color: Colors.black54,
-                child: ErrorView(message: _error!, onRetry: _load),
-              ),
-            if (c != null && c.value.isInitialized && !c.value.isPlaying)
-              Center(
-                child: IgnorePointer(
-                  child: Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withValues(alpha: 0.45),
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(
-                      Icons.play_arrow_rounded,
-                      color: Colors.white70,
-                      size: 40,
-                    ),
+          if (!_playing && !mini)
+            Center(
+              child: IgnorePointer(
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.45),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(
+                    Icons.play_arrow_rounded,
+                    color: Colors.white70,
+                    size: 40,
                   ),
                 ),
               ),
-            // 收缩提示：暂停时右下角显示一个上拉小图标
-            if (c != null && c.value.isInitialized && !c.value.isPlaying && !mini)
-              const Positioned(
-                right: 8,
-                bottom: 34,
-                child: IgnorePointer(
-                  child: Icon(
-                    Icons.keyboard_arrow_up_rounded,
-                    color: Colors.white38,
-                    size: 18,
-                  ),
-                ),
-              ),
-          ],
-        ),
+            ),
+        ],
       ),
     );
   }
 
-  Widget _buildControls(VideoPlayerController c, {required bool fullscreen}) {
-    final v = c.value;
+  /// 控制栏：完全对照官方截图
+  /// 顶栏：返回 / 标题 / 点赞 / 评论 / 收藏 / 投币 / 分享 / 更多
+  /// 底栏：播放 / 下一集 / 弹幕开关 / 弹幕输入框 / 倍速 / 清晰度
+  Widget _buildControls({required bool fullscreen}) {
     return Stack(
       children: [
         Positioned(
@@ -880,7 +838,7 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
                 begin: Alignment.topCenter,
                 end: Alignment.bottomCenter,
                 colors: [
-                  Colors.black.withValues(alpha: 0.62),
+                  Colors.black.withValues(alpha: 0.6),
                   Colors.transparent,
                 ],
               ),
@@ -909,13 +867,39 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
                     style: const TextStyle(color: Colors.white, fontSize: 13),
                   ),
                 ),
-                IconButton(
-                  icon: Icon(
-                    _danmakuOn ? Icons.subtitles : Icons.subtitles_off,
-                    color: Colors.white,
-                    size: 20,
-                  ),
-                  onPressed: () => setState(() => _danmakuOn = !_danmakuOn),
+                _topAction(
+                  icon: _liked ? Icons.thumb_up_alt : Icons.thumb_up_alt_outlined,
+                  label: formatCount(_likedCount),
+                  onTap: _toggleLike,
+                ),
+                _topAction(
+                  icon: Icons.chat_bubble_outline,
+                  label: formatCount(_commentTotal),
+                  onTap: () => _tabController.animateTo(1),
+                ),
+                _topAction(
+                  icon: _faved ? Icons.star : Icons.star_border,
+                  label: formatCount(_favCount),
+                  onTap: _toggleFav,
+                ),
+                _topAction(
+                  icon: _coinCount > 0
+                      ? Icons.monetization_on
+                      : Icons.monetization_on_outlined,
+                  label: _coinCount > 0 ? '$_coinCount' : '',
+                  onTap: _addCoin,
+                ),
+                _topAction(
+                  icon: Icons.ios_share,
+                  label: '',
+                  onTap: () {
+                    Clipboard.setData(
+                      ClipboardData(
+                        text: 'https://www.bilibili.com/video/${widget.bvid}',
+                      ),
+                    );
+                    _toast('链接已复制');
+                  },
                 ),
               ],
             ),
@@ -926,94 +910,191 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
           right: 0,
           bottom: 0,
           child: Container(
-            padding: const EdgeInsets.fromLTRB(4, 14, 4, 2),
+            padding: const EdgeInsets.fromLTRB(6, 12, 6, 4),
             decoration: BoxDecoration(
               gradient: LinearGradient(
                 begin: Alignment.bottomCenter,
                 end: Alignment.topCenter,
                 colors: [
-                  Colors.black.withValues(alpha: 0.72),
+                  Colors.black.withValues(alpha: 0.75),
                   Colors.transparent,
                 ],
               ),
             ),
-            child: Row(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
-                IconButton(
-                  icon: Icon(
-                    v.isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                    color: Colors.white,
-                    size: 26,
-                  ),
-                  onPressed: _togglePlay,
-                ),
-                Text(
-                  formatPlayerTime(v.position),
-                  style: const TextStyle(color: Colors.white, fontSize: 11),
-                ),
-                Expanded(
-                  child: SliderTheme(
-                    data: SliderTheme.of(context).copyWith(
-                      trackHeight: 2.5,
-                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-                      overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
-                      activeTrackColor: const Color(0xFFFB7299),
-                      inactiveTrackColor: Colors.white24,
-                      thumbColor: Colors.white,
+                // 进度条
+                Row(
+                  children: [
+                    Text(
+                      formatPlayerTime(_position),
+                      style: const TextStyle(color: Colors.white, fontSize: 10.5),
                     ),
-                    child: Slider(
-                      value: v.duration.inMilliseconds == 0
-                          ? 0
-                          : (v.position.inMilliseconds / v.duration.inMilliseconds)
-                              .clamp(0.0, 1.0),
-                      onChanged: (x) => c.seekTo(v.duration * x),
-                      onChangeStart: (_) => _hideTimer?.cancel(),
-                      onChangeEnd: (_) => _scheduleHide(),
+                    Expanded(
+                      child: SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          trackHeight: 2,
+                          thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
+                          overlayShape: const RoundSliderOverlayShape(overlayRadius: 10),
+                          activeTrackColor: Colors.white,
+                          inactiveTrackColor: Colors.white24,
+                          thumbColor: Colors.white,
+                        ),
+                        child: Slider(
+                          value: _duration.inMilliseconds == 0
+                              ? 0
+                              : (_position.inMilliseconds / _duration.inMilliseconds)
+                                  .clamp(0.0, 1.0),
+                          onChanged: (x) => _player.seek(_duration * x),
+                          onChangeStart: (_) => _hideTimer?.cancel(),
+                          onChangeEnd: (_) => _scheduleHide(),
+                        ),
+                      ),
                     ),
-                  ),
+                    Text(
+                      formatPlayerTime(_duration),
+                      style: const TextStyle(color: Colors.white, fontSize: 10.5),
+                    ),
+                  ],
                 ),
-                Text(
-                  formatPlayerTime(v.duration),
-                  style: const TextStyle(color: Colors.white, fontSize: 11),
-                ),
-                PopupMenuButton<int>(
-                  tooltip: '清晰度',
-                  color: Colors.black87,
-                  icon: const Icon(Icons.hd_outlined, color: Colors.white, size: 20),
-                  onSelected: _switchQuality,
-                  itemBuilder: (context) {
-                    final accepts = _playInfo?.acceptQuality ?? const <int>[];
-                    final qs = accepts.isEmpty ? const [64] : accepts;
-                    return [
-                      for (final q in qs)
-                        PopupMenuItem<int>(
-                          value: q,
+                // 底部功能条
+                Row(
+                  children: [
+                    IconButton(
+                      icon: Icon(
+                        _playing ? Icons.pause : Icons.play_arrow,
+                        color: Colors.white,
+                        size: 26,
+                      ),
+                      onPressed: _togglePlay,
+                    ),
+                    IconButton(
+                      tooltip: '下一个分P',
+                      icon: const Icon(Icons.skip_next, color: Colors.white, size: 22),
+                      onPressed: () {
+                        final pages = _detail?.pages ?? const [];
+                        if (_currentPageIndex < pages.length - 1) {
+                          _switchPage(_currentPageIndex + 1);
+                        }
+                      },
+                    ),
+                    IconButton(
+                      tooltip: _danmakuOn ? '关闭弹幕' : '开启弹幕',
+                      icon: Icon(
+                        _danmakuOn ? Icons.subtitles : Icons.subtitles_off,
+                        color: _danmakuOn ? Colors.white : Colors.white38,
+                        size: 20,
+                      ),
+                      onPressed: () => setState(() => _danmakuOn = !_danmakuOn),
+                    ),
+                    const SizedBox(width: 4),
+                    // 弹幕输入框（占位，点开提示）
+                    Expanded(
+                      child: GestureDetector(
+                        onTap: () => _toast('发送弹幕功能开发中'),
+                        child: Container(
+                          height: 30,
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          decoration: BoxDecoration(
+                            color: Colors.white24,
+                            borderRadius: BorderRadius.circular(15),
+                          ),
+                          alignment: Alignment.centerLeft,
                           child: Text(
-                            PlayInfo.nameOf(q),
-                            style: TextStyle(
-                              color: q == _selectedQuality
-                                  ? const Color(0xFFFB7299)
-                                  : Colors.white,
-                              fontSize: 13,
+                            _danmakuOn ? '发个弹幕见证当下' : '弹幕功能关闭',
+                            style: const TextStyle(
+                              color: Colors.white54,
+                              fontSize: 11.5,
                             ),
                           ),
                         ),
-                    ];
-                  },
-                ),
-                IconButton(
-                  icon: Icon(
-                    fullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
-                    color: Colors.white,
-                    size: 20,
-                  ),
-                  onPressed: _toggleFullscreen,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    TextButton(
+                      onPressed: _showRateSheet,
+                      child: Text(
+                        rateLabel(_rate),
+                        style: const TextStyle(color: Colors.white, fontSize: 12),
+                      ),
+                    ),
+                    PopupMenuButton<int>(
+                      tooltip: '清晰度',
+                      color: Colors.black87,
+                      onSelected: _switchQuality,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        child: Text(
+                          PlayInfo.nameOf(_selectedQuality),
+                          style: const TextStyle(color: Colors.white, fontSize: 12),
+                        ),
+                      ),
+                      itemBuilder: (context) {
+                        final accepts = _playInfo?.acceptQuality ?? const <int>[];
+                        final qs = accepts.isEmpty ? const [64] : accepts;
+                        return [
+                          for (final q in qs)
+                            PopupMenuItem<int>(
+                              value: q,
+                              child: Text(
+                                PlayInfo.nameOf(q),
+                                style: TextStyle(
+                                  color: q == _selectedQuality
+                                      ? const Color(0xFFFB7299)
+                                      : Colors.white,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ),
+                        ];
+                      },
+                    ),
+                    IconButton(
+                      icon: Icon(
+                        fullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
+                        color: Colors.white,
+                        size: 20,
+                      ),
+                      onPressed: _toggleFullscreen,
+                    ),
+                  ],
                 ),
               ],
             ),
           ),
         ),
+        if (_buffering)
+          const Center(
+            child: SizedBox(
+              width: 26,
+              height: 26,
+              child: CircularProgressIndicator(color: Colors.white70, strokeWidth: 2),
+            ),
+          ),
       ],
+    );
+  }
+
+  Widget _topAction({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(6),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: Colors.white, size: 18),
+            if (label.isNotEmpty)
+              Text(label, style: const TextStyle(color: Colors.white, fontSize: 8.5)),
+          ],
+        ),
+      ),
     );
   }
 
@@ -1038,146 +1119,186 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
       color: theme.scaffoldBackgroundColor,
       child: Column(
         children: [
-          _buildInfoCard(detail),
-          _buildActionBar(detail),
+          _buildOwnerRow(detail),
+          _buildTitleRow(detail),
+          _buildStatRow(detail),
+          _buildActionRow(detail),
           TabBar(
             controller: _tabController,
-            labelColor: theme.colorScheme.onSurface,
+            labelColor: const Color(0xFFFB7299),
             unselectedLabelColor: theme.colorScheme.onSurfaceVariant,
             indicatorColor: const Color(0xFFFB7299),
             indicatorSize: TabBarIndicatorSize.label,
-            labelStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-            unselectedLabelStyle: const TextStyle(fontSize: 13),
-            tabs: [
-              // 官方 BBVideoModule 里就是两个 TabItem：VDDescTabItem / VDCommentTabItem
-              const Tab(text: '简介'),
-              Tab(
-                text: _commentTotal > 0
-                    ? '评论 ${formatCount(_commentTotal)}'
-                    : '评论',
-              ),
-            ],
+            labelStyle: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600),
+            unselectedLabelStyle: const TextStyle(fontSize: 13.5),
+            tabs: const [Tab(text: '简介'), Tab(text: '评论')],
           ),
           Expanded(
             child: TabBarView(
               controller: _tabController,
+              children: [_buildIntroTab(detail), _buildCommentTab()],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// UP 主行：头像 + 昵称 + 粉丝数 + 关注按钮（对照截图）
+  Widget _buildOwnerRow(VideoDetail detail) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 4),
+      child: Row(
+        children: [
+          InkWell(
+            onTap: _openSpace,
+            child: Row(
               children: [
-                _buildIntroTab(detail),
-                _buildCommentTab(),
+                CircleAvatar(
+                  radius: 18,
+                  backgroundColor: theme.colorScheme.surfaceContainerHighest,
+                  backgroundImage:
+                      detail.ownerFace.isEmpty ? null : NetworkImage(detail.ownerFace),
+                  child: detail.ownerFace.isEmpty
+                      ? const Icon(Icons.person, size: 16)
+                      : null,
+                ),
+                const SizedBox(width: 8),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      detail.ownerName,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 1),
+                    Text(
+                      '${formatCount(detail.view)} 播放',
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                        fontSize: 10,
+                      ),
+                    ),
+                  ],
+                ),
               ],
             ),
           ),
+          const Spacer(),
+          // 关注按钮（粉色胶囊，对照截图）
+          SizedBox(
+            height: 30,
+            child: ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFFFB7299),
+                foregroundColor: Colors.white,
+                elevation: 0,
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(15),
+                ),
+              ),
+              onPressed: () => _toast('关注功能开发中'),
+              child: const Text('+ 关注', style: TextStyle(fontSize: 12.5)),
+            ),
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildInfoCard(VideoDetail detail) {
+  Widget _buildTitleRow(VideoDetail detail) {
     final theme = Theme.of(context);
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
-      child: Column(
+      padding: const EdgeInsets.fromLTRB(14, 6, 14, 4),
+      child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            detail.title,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: theme.textTheme.titleSmall?.copyWith(
-              fontWeight: FontWeight.w600,
-              height: 1.3,
+          Expanded(
+            child: Text(
+              detail.title,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.titleSmall?.copyWith(
+                fontWeight: FontWeight.w600,
+                height: 1.35,
+              ),
             ),
           ),
-          const SizedBox(height: 4),
-          Row(
-            children: [
-              Text(
-                '${formatCount(detail.view)} 播放 · ${formatCount(detail.danmakuCount)} 弹幕',
-                style: theme.textTheme.labelSmall?.copyWith(
-                  color: theme.colorScheme.onSurfaceVariant,
-                ),
-              ),
-              const SizedBox(width: 8),
-              Text(
-                formatRelativeTime(detail.pubdate),
-                style: theme.textTheme.labelSmall?.copyWith(
-                  color: theme.colorScheme.onSurfaceVariant,
-                ),
-              ),
-            ],
-          ),
+          const Icon(Icons.keyboard_arrow_down, size: 18),
         ],
       ),
     );
   }
 
-  /// 操作栏：UP 主 + 点赞/投币/收藏/分享
-  Widget _buildActionBar(VideoDetail detail) {
+  /// 播放量 / 弹幕 / 日期 / 正在看
+  Widget _buildStatRow(VideoDetail detail) {
     final theme = Theme.of(context);
+    final s = theme.textTheme.labelSmall?.copyWith(
+      color: theme.colorScheme.onSurfaceVariant,
+      fontSize: 10.5,
+    );
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 2, 12, 6),
+      padding: const EdgeInsets.fromLTRB(14, 0, 14, 8),
       child: Row(
         children: [
-          Expanded(
-            child: InkWell(
-              onTap: _openSpace,
-              borderRadius: BorderRadius.circular(20),
-              child: Row(
-                children: [
-                  CircleAvatar(
-                    radius: 15,
-                    backgroundColor: theme.colorScheme.surfaceContainerHighest,
-                    backgroundImage:
-                        detail.ownerFace.isEmpty ? null : NetworkImage(detail.ownerFace),
-                    child: detail.ownerFace.isEmpty
-                        ? const Icon(Icons.person, size: 15)
-                        : null,
-                  ),
-                  const SizedBox(width: 6),
-                  Flexible(
-                    child: Text(
-                      detail.ownerName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.labelMedium?.copyWith(
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ),
-                  const Icon(Icons.chevron_right, size: 14),
-                ],
-              ),
-            ),
-          ),
-          _actionButton(
-            icon: _liked ? Icons.thumb_up_alt : Icons.thumb_up_alt_outlined,
+          Icon(Icons.play_circle_outline, size: 12, color: theme.colorScheme.onSurfaceVariant),
+          const SizedBox(width: 3),
+          Text(formatCount(detail.view), style: s),
+          const SizedBox(width: 12),
+          Icon(Icons.subtitles_outlined, size: 12, color: theme.colorScheme.onSurfaceVariant),
+          const SizedBox(width: 3),
+          Text(formatCount(detail.danmakuCount), style: s),
+          const SizedBox(width: 12),
+          Text(_formatDate(detail.pubdate), style: s),
+        ],
+      ),
+    );
+  }
+
+  String _formatDate(int unix) {
+    if (unix <= 0) return '';
+    final t = DateTime.fromMillisecondsSinceEpoch(unix * 1000);
+    return '${t.year}年${t.month}月${t.day}日';
+  }
+
+  /// 点赞 / 不喜欢 / 投币 / 收藏 / 分享（对照截图的圆形图标行）
+  Widget _buildActionRow(VideoDetail detail) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 4, 14, 10),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceAround,
+        children: [
+          _roundAction(
+            icon: _liked ? Icons.thumb_up : Icons.thumb_up_outlined,
             label: formatCount(_likedCount),
-            active: _liked,
             onTap: _toggleLike,
           ),
-          _actionButton(
-            icon: _coinCount > 0
-                ? Icons.monetization_on
-                : Icons.monetization_on_outlined,
-            label: _coinCount > 0 ? '$_coinCount/2' : '投币',
-            active: _coinCount > 0,
+          _roundAction(
+            icon: Icons.thumb_down_outlined,
+            label: '不喜欢',
+            onTap: () => _toast('感谢反馈'),
+          ),
+          _roundAction(
+            icon: _coinCount > 0 ? Icons.monetization_on : Icons.monetization_on_outlined,
+            label: _coinCount > 0 ? '$_coinCount/2' : formatCount(0),
             onTap: _addCoin,
           ),
-          _actionButton(
+          _roundAction(
             icon: _faved ? Icons.star : Icons.star_border,
             label: formatCount(_favCount),
-            active: _faved,
             onTap: _toggleFav,
           ),
-          _actionButton(
-            icon: Icons.ios_share,
-            label: '分享',
-            active: false,
+          _roundAction(
+            icon: Icons.reply,
+            label: formatCount(detail.share),
             onTap: () {
               Clipboard.setData(
-                ClipboardData(
-                  text: 'https://www.bilibili.com/video/${widget.bvid}',
-                ),
+                ClipboardData(text: 'https://www.bilibili.com/video/${widget.bvid}'),
               );
               _toast('链接已复制');
             },
@@ -1187,26 +1308,29 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
     );
   }
 
-  Widget _actionButton({
+  Widget _roundAction({
     required IconData icon,
     required String label,
-    required bool active,
     required VoidCallback onTap,
   }) {
-    final color = active
-        ? const Color(0xFFFB7299)
-        : Theme.of(context).colorScheme.onSurfaceVariant;
+    final theme = Theme.of(context);
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(8),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon, size: 19, color: color),
-            const SizedBox(height: 1),
-            Text(label, style: TextStyle(fontSize: 9.5, color: color)),
+            Icon(icon, size: 24, color: theme.colorScheme.onSurface),
+            const SizedBox(height: 3),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 10,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
           ],
         ),
       ),
@@ -1222,22 +1346,14 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
       children: [
         if (detail.pages.length > 1) _buildPageSelector(detail),
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 10, 16, 6),
+          padding: const EdgeInsets.fromLTRB(14, 10, 14, 6),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              if (detail.desc.trim().isNotEmpty)
-                Text(
-                  detail.desc.trim(),
-                  style: theme.textTheme.bodySmall?.copyWith(height: 1.6),
-                )
-              else
-                Text(
-                  '该视频没有简介',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
+              Text(
+                detail.desc.trim().isEmpty ? '该视频没有简介' : detail.desc.trim(),
+                style: theme.textTheme.bodySmall?.copyWith(height: 1.6),
+              ),
               if (_tags.isNotEmpty) ...[
                 const SizedBox(height: 10),
                 Wrap(
@@ -1246,10 +1362,7 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
                   children: [
                     for (final tag in _tags)
                       Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                          vertical: 3,
-                        ),
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                         decoration: BoxDecoration(
                           color: theme.colorScheme.surfaceContainerHighest,
                           borderRadius: BorderRadius.circular(10),
@@ -1270,16 +1383,14 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
         const Divider(height: 14, thickness: 0.5),
         if (_related.isNotEmpty) ...[
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 2, 16, 4),
+            padding: const EdgeInsets.fromLTRB(14, 2, 14, 4),
             child: Text(
               '相关推荐',
-              style: theme.textTheme.titleSmall?.copyWith(
-                fontWeight: FontWeight.w600,
-              ),
+              style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
             ),
           ),
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 14),
+            padding: const EdgeInsets.symmetric(horizontal: 12),
             child: Column(
               children: [
                 for (final item in _related.take(20))
@@ -1298,7 +1409,7 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
       height: 42,
       child: ListView.separated(
         scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
         itemCount: detail.pages.length,
         separatorBuilder: (_, _) => const SizedBox(width: 8),
         itemBuilder: (context, i) {
@@ -1357,18 +1468,14 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
               child: Center(
                 child: _commentHasMore
                     ? TextButton(
-                        onPressed: _commentLoading
-                            ? null
-                            : () => _loadComments(reset: false),
+                        onPressed:
+                            _commentLoading ? null : () => _loadComments(reset: false),
                         child: Text(
                           _commentLoading ? '加载中…' : '查看更多评论',
                           style: const TextStyle(fontSize: 12),
                         ),
                       )
-                    : Text(
-                        '没有更多了',
-                        style: theme.textTheme.labelSmall,
-                      ),
+                    : Text('没有更多了', style: theme.textTheme.labelSmall),
               ),
             );
           }
@@ -1381,7 +1488,7 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
   Widget _commentTile(Comment c) {
     final theme = Theme.of(context);
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 9, 16, 9),
+      padding: const EdgeInsets.fromLTRB(14, 9, 14, 9),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1412,30 +1519,21 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
                     if (c.level > 0) ...[
                       const SizedBox(width: 4),
                       Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 3,
-                          vertical: 1,
-                        ),
+                        padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
                         decoration: BoxDecoration(
                           color: const Color(0xFFFB7299).withValues(alpha: 0.15),
                           borderRadius: BorderRadius.circular(3),
                         ),
                         child: Text(
                           'Lv${c.level}',
-                          style: const TextStyle(
-                            fontSize: 9,
-                            color: Color(0xFFFB7299),
-                          ),
+                          style: const TextStyle(fontSize: 9, color: Color(0xFFFB7299)),
                         ),
                       ),
                     ],
                   ],
                 ),
                 const SizedBox(height: 3),
-                Text(
-                  c.content,
-                  style: theme.textTheme.bodySmall?.copyWith(height: 1.45),
-                ),
+                Text(c.content, style: theme.textTheme.bodySmall?.copyWith(height: 1.45)),
                 const SizedBox(height: 4),
                 Row(
                   children: [
