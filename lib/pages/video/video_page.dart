@@ -430,7 +430,8 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
       if (!mounted) return;
       if (results.isEmpty) {
         final canWrite = await BiliApi.instance.canWrite();
-        _toast(canWrite ? '操作未完成，请稍后重试' : '请先扫码登录');
+        // 官方文案：「登录后即可一键三连」
+        _toast(canWrite ? '操作未完成，请稍后重试' : '登录后即可一键三连');
       } else {
         _toast('已${results.join('、')}');
       }
@@ -1048,8 +1049,13 @@ class _VideoPageState extends State<VideoPage> with SingleTickerProviderStateMix
             labelStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
             unselectedLabelStyle: const TextStyle(fontSize: 13),
             tabs: [
+              // 官方 BBVideoModule 里就是两个 TabItem：VDDescTabItem / VDCommentTabItem
               const Tab(text: '简介'),
-              Tab(text: '评论 ${_commentTotal > 0 ? formatCount(_commentTotal) : ''}'.trim()),
+              Tab(
+                text: _commentTotal > 0
+                    ? '评论 ${formatCount(_commentTotal)}'
+                    : '评论',
+              ),
             ],
           ),
           Expanded(
